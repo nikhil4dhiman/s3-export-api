@@ -1,3 +1,119 @@
 # s3-export-api
 
-.NET 8 Web API that uploads user data to S3 without writing to local disk. Scaffolding incoming via PR.
+A .NET 8 Web API that uploads user files to an Amazon S3 bucket **without writing anything to local disk**. Two approaches are implemented side-by-side so you can choose the one that fits your architecture.
+
+---
+
+## How to Run
+
+```bash
+dotnet restore
+export AWS__Region=us-east-1
+export S3__BucketName=your-bucket
+dotnet run --project src/S3ExportApi
+```
+
+Swagger UI is available at: **http://localhost:5000/swagger**
+
+> **AWS credentials** are resolved via the standard AWS SDK credential chain (environment variables `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, EC2 instance profile, etc.).
+
+---
+
+## Memory Profile
+
+| Resource | Footprint |
+|---|---|
+| Active Approach A export | ~5–10 MB (one S3 part buffer per session) |
+| Active Approach B file upload | negligible (streamed directly to S3) |
+| Temp files on disk | **none** |
+
+---
+
+## Approach A — Streaming ZIP (in-memory, stateful)
+
+Files are written directly into a `ZipArchive` whose underlying stream buffers data into 5 MB chunks and flushes them as S3 multipart upload parts. The ZIP is never materialised on disk; it exists only as in-flight bytes in memory.
+
+**Best for:** single-instance deployments, lowest latency, simplest client.
+
+### Endpoint Summary
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/approach-a/exports/start?userId=` | Start export session, returns `{ exportId }` |
+| `POST` | `/api/approach-a/exports/{exportId}/files?fileName=` | Upload small file (stream body) |
+| `POST` | `/api/approach-a/exports/{exportId}/files/multipart/start` | Begin large-file upload, returns `{ fileUploadId }` |
+| `PUT` | `/api/approach-a/exports/{exportId}/files/multipart/{fileUploadId}/parts` | Append a part to the open entry |
+| `POST` | `/api/approach-a/exports/{exportId}/files/multipart/{fileUploadId}/complete` | Close entry, release write lock |
+| `POST` | `/api/approach-a/exports/{exportId}/complete` | Finalise ZIP, complete S3 upload, returns `{ exportId, s3Url }` |
+| `DELETE` | `/api/approach-a/exports/{exportId}` | Abort and discard the export |
+
+### Flow
+
+```
+POST /start          → creates S3 multipart upload + in-memory ZipArchive
+POST /files          → appends a zip entry (small file, single request)
+POST /files/multipart/start  → opens a zip entry, acquires write lock
+PUT  /files/multipart/{id}/parts  → streams bytes into the open entry
+POST /files/multipart/{id}/complete  → closes entry, releases write lock
+POST /complete       → flushes ZIP central directory → CompleteMultipartUpload on S3
+```
+
+---
+
+## Approach B — Staged ZIP (stateless per request)
+
+Each file is uploaded directly to `exports/{exportId}/staging/{fileName}` in S3 as an independent object. When `/complete` is called, a synchronous job streams each staged object through a `ZipArchive` whose output is a new S3 multipart upload (`exports/{exportId}/final.zip`). Staging objects are deleted afterwards.
+
+**Best for:** horizontally scaled, stateless API deployments.
+
+### Endpoint Summary
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/approach-b/exports/start` | Allocate an exportId (stateless), returns `{ exportId }` |
+| `POST` | `/api/approach-b/exports/{exportId}/files?fileName=` | Stream file to S3 staging prefix |
+| `POST` | `/api/approach-b/exports/{exportId}/files/multipart/start` | Start S3 multipart upload to staging, returns `{ fileUploadId, key }` |
+| `PUT` | `/api/approach-b/exports/{exportId}/files/multipart/parts?fileName=&uploadId=&partNumber=` | Upload a part (requires `Content-Length` header) |
+| `POST` | `/api/approach-b/exports/{exportId}/files/multipart/complete` | Complete S3 multipart upload for a staged file |
+| `POST` | `/api/approach-b/exports/{exportId}/complete` | Zip all staged files → final.zip in S3, returns `{ exportId, s3Url }` |
+
+### How the Background Zip Works
+
+```
+POST /complete triggers ExportZipJob.RunAsync():
+  1. ListObjectsV2  exports/{exportId}/staging/*
+  2. InitiateMultipartUpload  exports/{exportId}/final.zip
+  3. For each staged object:
+       GetObject (stream) → ZipArchive entry → S3MultipartUploadStream (5 MB parts)
+  4. CompleteMultipartUpload on final.zip
+  5. DeleteObjects (staging cleanup)
+  6. Return s3://bucket/exports/{exportId}/final.zip
+```
+
+No bytes touch local disk — staging objects are re-streamed from S3 directly into the ZIP multipart upload.
+
+---
+
+## Project Structure
+
+```
+S3ExportApi.sln
+src/S3ExportApi/
+├── S3ExportApi.csproj
+├── Program.cs
+├── appsettings.json
+├── appsettings.Development.json
+├── Configuration/
+│   └── S3Options.cs                    # S3:BucketName config binding
+├── Common/
+│   └── S3MultipartUploadStream.cs      # Write-only Stream → S3 multipart parts
+├── Storage/
+│   └── IExportRepository.cs            # In-memory URL store
+├── ApproachA_StreamingZip/
+│   ├── ExportSession.cs                # Per-export state (ZipArchive + S3 stream)
+│   ├── ExportSessionStore.cs           # ConcurrentDictionary session registry
+│   └── ExportsStreamingController.cs   # REST endpoints for Approach A
+└── ApproachB_StagedZip/
+    ├── ExportZipJob.cs                 # Zip-and-upload synchronous job
+    └── ExportsStagedController.cs      # REST endpoints for Approach B
+```
