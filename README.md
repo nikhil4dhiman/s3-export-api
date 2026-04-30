@@ -130,6 +130,25 @@ The client picks the right endpoint per file: small files go through the single-
 
 ---
 
+## Companion CLI — `S3ExportUploader.Py` (Python)
+
+A Python 3 alternative to the .NET CLI under `src/S3ExportUploader.Py`. It scans a configured folder, starts an export session, uploads every file (single-shot or multipart based on size), and finalises the export. Supports both approaches, configurable concurrency, automatic retry with exponential backoff on transient failures, and **resume across runs** via a JSON state file. No third-party dependencies — runs on any Python ≥ 3.10.
+
+```bash
+# Approach A — full folder upload
+python3 src/S3ExportUploader.Py/s3_export_uploader.py \
+    --approach a --folder ./outbox --complete
+
+# Approach B — recursive, 16 MB parts, 8-way parallelism, resumable
+python3 src/S3ExportUploader.Py/s3_export_uploader.py \
+    --approach b --folder ./outbox --recursive \
+    --part-size 16mb --parallelism 8 --resume --complete
+```
+
+See [`src/S3ExportUploader.Py/README.md`](src/S3ExportUploader.Py/README.md) for the full option reference and resume semantics.
+
+---
+
 ## Postman Collections
 
 Importable Postman collections for both approaches live under [`docs/postman/`](docs/postman/). See the [README there](docs/postman/README.md) for how to import and the variables to set.
@@ -161,4 +180,7 @@ src/S3ExportApi/
 src/S3ExportUploader/
 ├── S3ExportUploader.csproj
 └── Program.cs                          # CLI: splits large files, uploads via approach A or B
+src/S3ExportUploader.Py/
+├── s3_export_uploader.py               # Python folder-driven CLI: resume, retry, parallelism
+└── README.md
 ```
