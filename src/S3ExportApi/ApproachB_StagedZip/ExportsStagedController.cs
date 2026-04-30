@@ -86,18 +86,39 @@ public class ExportsStagedController : ControllerBase
             return BadRequest("uploadId query parameter is required.");
 
         var key = $"exports/{exportId}/staging/{fileName}";
-        var resp = await _s3.UploadPartAsync(new UploadPartRequest
-        {
-            BucketName = _bucket,
-            Key = key,
-            UploadId = uploadId,
-            PartNumber = partNumber,
-            PartSize = Request.ContentLength.Value,
-            InputStream = Request.Body,
-            DisablePayloadSigning = true
-        }, ct);
 
-        return Ok(new { etag = resp.ETag });
+        // The AWS SDK's UploadPartAsync wraps InputStream in PartialWrapperStream,
+        // which requires a seekable base stream. ASP.NET's Request.Body is forward-only,
+        // so spool the part to a temp file and hand a seekable FileStream to the SDK.
+        var tempPath = Path.Combine(Path.GetTempPath(), $"s3part-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await using (var spool = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write,
+                                                    FileShare.None, bufferSize: 81920, useAsync: true))
+            {
+                await Request.Body.CopyToAsync(spool, ct);
+            }
+
+            await using var partStream = new FileStream(tempPath, FileMode.Open, FileAccess.Read,
+                                                       FileShare.Read, bufferSize: 81920, useAsync: true);
+
+            var resp = await _s3.UploadPartAsync(new UploadPartRequest
+            {
+                BucketName = _bucket,
+                Key = key,
+                UploadId = uploadId,
+                PartNumber = partNumber,
+                PartSize = partStream.Length,
+                InputStream = partStream
+            }, ct);
+
+            return Ok(new { etag = resp.ETag });
+        }
+        finally
+        {
+            try { if (System.IO.File.Exists(tempPath)) System.IO.File.Delete(tempPath); }
+            catch { /* best-effort cleanup */ }
+        }
     }
 
     /// <summary>Complete a multipart file upload to staging.</summary>
