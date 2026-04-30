@@ -130,22 +130,22 @@ The client picks the right endpoint per file: small files go through the single-
 
 ---
 
-## Companion CLI — `S3ExportUploader.Py` (Python)
+## Folder-driven CLI — `S3ExportFolderUploader`
 
-A Python 3 alternative to the .NET CLI under `src/S3ExportUploader.Py`. It scans a configured folder, starts an export session, uploads every file (single-shot or multipart based on size), and finalises the export. Supports both approaches, configurable concurrency, automatic retry with exponential backoff on transient failures, and **resume across runs** via a JSON state file. No third-party dependencies — runs on any Python ≥ 3.10.
+A second .NET 8 console app under `src/S3ExportFolderUploader` that takes a folder path, starts an export session, walks every file, uploads it through the right endpoint (single-shot or multipart based on `--threshold`) for either Approach A or B, and optionally finalises the export. Adds **resume across runs** (JSON state file), **retry with exponential backoff** on transient HTTP failures, and **concurrency controls** (`--parallelism` for Approach B).
 
 ```bash
-# Approach A — full folder upload
-python3 src/S3ExportUploader.Py/s3_export_uploader.py \
+# Approach A — sequential streaming upload of a whole folder
+dotnet run --project src/S3ExportFolderUploader -- \
     --approach a --folder ./outbox --complete
 
 # Approach B — recursive, 16 MB parts, 8-way parallelism, resumable
-python3 src/S3ExportUploader.Py/s3_export_uploader.py \
+dotnet run --project src/S3ExportFolderUploader -- \
     --approach b --folder ./outbox --recursive \
     --part-size 16mb --parallelism 8 --resume --complete
 ```
 
-See [`src/S3ExportUploader.Py/README.md`](src/S3ExportUploader.Py/README.md) for the full option reference and resume semantics.
+See [`src/S3ExportFolderUploader/README.md`](src/S3ExportFolderUploader/README.md) for the full option reference and resume semantics.
 
 ---
 
@@ -180,7 +180,8 @@ src/S3ExportApi/
 src/S3ExportUploader/
 ├── S3ExportUploader.csproj
 └── Program.cs                          # CLI: splits large files, uploads via approach A or B
-src/S3ExportUploader.Py/
-├── s3_export_uploader.py               # Python folder-driven CLI: resume, retry, parallelism
+src/S3ExportFolderUploader/
+├── S3ExportFolderUploader.csproj
+├── Program.cs                          # Folder-driven CLI with resume, retry, parallelism
 └── README.md
 ```
