@@ -1,0 +1,171 @@
+{
+  "info": {
+    "name": "S3 Export API — Approach B (Staged ZIP)",
+    "description": "Endpoints for the staged-zip approach. Each file is uploaded as its own object under `exports/{exportId}/staging/...` (using S3 multipart for large files). The final ZIP is built and uploaded synchronously when `Complete export` is called.\n\nBecause there is no shared writer, **multiple files and multiple parts of the same file can be uploaded in parallel**.\n\n## Variables\n- `baseUrl` — e.g. `http://localhost:5000`\n- `exportId` — set automatically from `Start export`\n- `fileName` — name of the file being uploaded\n- `uploadId` — S3 multipart upload id, set automatically from `Start multipart file`\n- `partNumber` — 1-based part index for `Upload part`\n- `etagPart1` / `etagPart2` — ETags returned by `Upload part`, used in `Complete multipart file`\n\n## Typical flow\n1. Start export → captures `exportId`\n2. Upload small file (raw body) — repeat for each small file (can be parallel)\n3. Start multipart file → captures `uploadId`\n4. Upload part (×N, can be parallel; out-of-order is fine) — capture each `etag`\n5. Complete multipart file (send the parts list)\n6. Complete export → returns the final S3 URL",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5000" },
+    { "key": "exportId", "value": "" },
+    { "key": "fileName", "value": "big.csv" },
+    { "key": "uploadId", "value": "" },
+    { "key": "partNumber", "value": "1" },
+    { "key": "etagPart1", "value": "" },
+    { "key": "etagPart2", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "1. Start export",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-b/exports/start",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-b", "exports", "start"]
+        },
+        "description": "Stateless. Just returns a new `exportId`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.exportId) {",
+              "    pm.collectionVariables.set('exportId', json.exportId);",
+              "    console.log('exportId =', json.exportId);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Upload small file (raw body)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/octet-stream" }
+        ],
+        "body": {
+          "mode": "file",
+          "file": { "src": "" },
+          "description": "Select a local file. Streamed straight to S3 as a single PutObject under `exports/{exportId}/staging/{fileName}`."
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-b/exports/{{exportId}}/files?fileName={{fileName}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-b", "exports", "{{exportId}}", "files"],
+          "query": [{ "key": "fileName", "value": "{{fileName}}" }]
+        }
+      }
+    },
+    {
+      "name": "3. Start multipart file",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fileName\": \"{{fileName}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-b/exports/{{exportId}}/files/multipart/start",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-b", "exports", "{{exportId}}", "files", "multipart", "start"]
+        },
+        "description": "Initiates an S3 multipart upload for the staging key. Returns `fileUploadId` (= S3 UploadId) and `key`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.fileUploadId) {",
+              "    pm.collectionVariables.set('uploadId', json.fileUploadId);",
+              "    console.log('uploadId =', json.fileUploadId);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Upload part (raw body)",
+      "request": {
+        "method": "PUT",
+        "header": [
+          { "key": "Content-Type", "value": "application/octet-stream" }
+        ],
+        "body": {
+          "mode": "file",
+          "file": { "src": "" },
+          "description": "Select the part chunk. All parts except the last must be ≥ 5 MB (S3 requirement). Postman will send Content-Length automatically."
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-b/exports/{{exportId}}/files/multipart/parts?fileName={{fileName}}&uploadId={{uploadId}}&partNumber={{partNumber}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-b", "exports", "{{exportId}}", "files", "multipart", "parts"],
+          "query": [
+            { "key": "fileName", "value": "{{fileName}}" },
+            { "key": "uploadId", "value": "{{uploadId}}" },
+            { "key": "partNumber", "value": "{{partNumber}}" }
+          ]
+        },
+        "description": "Update `partNumber` between calls (1, 2, …). Save the returned `etag` into `etagPart{N}` for the complete step."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "const partNumber = pm.collectionVariables.get('partNumber');",
+              "if (json && json.etag) {",
+              "    pm.collectionVariables.set('etagPart' + partNumber, json.etag);",
+              "    console.log('etagPart' + partNumber + ' =', json.etag);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Complete multipart file",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fileName\": \"{{fileName}}\",\n  \"uploadId\": \"{{uploadId}}\",\n  \"parts\": [\n    { \"partNumber\": 1, \"eTag\": {{etagPart1}} },\n    { \"partNumber\": 2, \"eTag\": {{etagPart2}} }\n  ]\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-b/exports/{{exportId}}/files/multipart/complete",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-b", "exports", "{{exportId}}", "files", "multipart", "complete"]
+        },
+        "description": "Tells S3 to assemble the parts into a single staged object. The `eTag` values come back from `Upload part` already wrapped in quotes — the placeholders are interpolated as JSON strings (e.g. `\\\"abc123\\\"`)."
+      }
+    },
+    {
+      "name": "6. Complete export",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-b/exports/{{exportId}}/complete",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-b", "exports", "{{exportId}}", "complete"]
+        },
+        "description": "Synchronously runs the zip job: streams every staged object into a ZIP and uploads the ZIP to `exports/{exportId}/final.zip`. Returns `s3Url`."
+      }
+    }
+  ]
+}
