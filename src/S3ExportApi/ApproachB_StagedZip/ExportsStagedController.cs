@@ -93,7 +93,8 @@ public class ExportsStagedController : ControllerBase
             UploadId = uploadId,
             PartNumber = partNumber,
             PartSize = Request.ContentLength.Value,
-            InputStream = Request.Body
+            InputStream = Request.Body,
+            DisablePayloadSigning = true
         }, ct);
 
         return Ok(new { etag = resp.ETag });
