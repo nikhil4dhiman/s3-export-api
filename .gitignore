@@ -87,3 +87,7 @@ ScaffoldingReadMe.txt
 # Publish Web Output
 *.[Pp]ublish.xml
 *.azurePubxml
+
+# Python
+__pycache__/
+*.py[cod]
