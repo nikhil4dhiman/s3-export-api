@@ -94,6 +94,48 @@ No bytes touch local disk — staging objects are re-streamed from S3 directly i
 
 ---
 
+## Companion CLI — `S3ExportUploader`
+
+A small .NET console app under `src/S3ExportUploader` that splits large files into S3-compliant parts (≥ 5 MB) and uploads them through the API using either approach. Files are streamed directly from disk — no intermediate splits are written to local storage.
+
+### Build & run
+
+```bash
+dotnet build S3ExportApi.sln
+
+# Approach A — sequential parts into a streaming zip
+dotnet run --project src/S3ExportUploader -- \
+  --approach a --complete ./big.bin
+
+# Approach B — parallel parts into staged zip, 16 MB parts, 8-way parallelism
+dotnet run --project src/S3ExportUploader -- \
+  --approach b --part-size 16mb --parallelism 8 --complete a.bin b.bin
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--api <url>` | API base URL (default `http://localhost:5000`) |
+| `--approach <a\|b>` | `a` = streaming zip, `b` = staged zip (required) |
+| `--user <id>` | userId for Approach A (default `anonymous`) |
+| `--export-id <guid>` | reuse an existing export instead of starting a new one |
+| `--name <name>` | override remote file name (single-file mode) |
+| `--complete` | call `/complete` after uploads finish |
+| `--part-size <size>` | multipart part size, e.g. `8mb`, `16mb`, `1gb` (default `8mb`, min `5mb`) |
+| `--threshold <size>` | use multipart for files larger than this (default = `--part-size`) |
+| `--parallelism <n>` | parallel parts for Approach B (default `4`; A is always sequential) |
+
+The client picks the right endpoint per file: small files go through the single-shot upload, files larger than `--threshold` are split into `--part-size` chunks and uploaded as multipart. Approach A keeps parts strictly sequential (server holds a per-session write lock); Approach B uploads parts concurrently.
+
+---
+
+## Postman Collections
+
+Importable Postman collections for both approaches live under [`docs/postman/`](docs/postman/). See the [README there](docs/postman/README.md) for how to import and the variables to set.
+
+---
+
 ## Project Structure
 
 ```
@@ -116,4 +158,7 @@ src/S3ExportApi/
 └── ApproachB_StagedZip/
     ├── ExportZipJob.cs                 # Zip-and-upload synchronous job
     └── ExportsStagedController.cs      # REST endpoints for Approach B
+src/S3ExportUploader/
+├── S3ExportUploader.csproj
+└── Program.cs                          # CLI: splits large files, uploads via approach A or B
 ```
