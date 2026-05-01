@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Threading.Channels;
 using Amazon.S3;
 using Amazon.S3.Model;
 using Microsoft.Extensions.Options;
@@ -11,6 +12,7 @@ namespace S3ExportApi.ApproachB_StagedZip;
 public class ExportZipJob
 {
     private readonly IAmazonS3 _s3;
+    private readonly S3Options _options;
     private readonly string _bucket;
     private readonly IExportRepository _repo;
     private readonly ILogger<ExportZipJob> _log;
@@ -18,7 +20,8 @@ public class ExportZipJob
     public ExportZipJob(IAmazonS3 s3, IOptions<S3Options> opt, IExportRepository repo, ILogger<ExportZipJob> log)
     {
         _s3 = s3;
-        _bucket = opt.Value.BucketName;
+        _options = opt.Value;
+        _bucket = _options.BucketName;
         _repo = repo;
         _log = log;
     }
@@ -54,18 +57,71 @@ public class ExportZipJob
         try
         {
             await using var partStream = new S3MultipartUploadStream(_s3, _bucket, finalKey, init.UploadId);
-            using (var zip = new ZipArchive(partStream, ZipArchiveMode.Create, leaveOpen: true))
-            {
-                foreach (var obj in staged)
+
+            // Bounded producer/consumer pipeline: N parallel S3 downloads feed a
+            // single zip writer. The zip format is inherently sequential, so the
+            // writer stays single-threaded; the wins come from overlapping S3
+            // GetObject latency and the API->S3 final upload with subsequent
+            // downloads.
+            var fanOut = Math.Max(1, _options.ZipFanOut);
+            var channel = Channel.CreateBounded<StagedDownload>(
+                new BoundedChannelOptions(fanOut)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    var name = obj.Key.Substring(stagingPrefix.Length);
-                    var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
-                    using var get = await _s3.GetObjectAsync(_bucket, obj.Key, ct);
-                    await using var entryStream = entry.Open();
-                    await get.ResponseStream.CopyToAsync(entryStream, ct);
+                    SingleReader = true,
+                    SingleWriter = false,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+
+            using var producerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+            var producer = Task.Run(async () =>
+            {
+                try
+                {
+                    await Parallel.ForEachAsync(staged, new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = fanOut,
+                        CancellationToken = producerCts.Token
+                    }, async (obj, c) =>
+                    {
+                        var get = await _s3.GetObjectAsync(_bucket, obj.Key, c);
+                        var name = obj.Key.Substring(stagingPrefix.Length);
+                        await channel.Writer.WriteAsync(new StagedDownload(name, get), c);
+                    });
+                }
+                finally
+                {
+                    channel.Writer.TryComplete();
+                }
+            }, producerCts.Token);
+
+            try
+            {
+                using (var zip = new ZipArchive(partStream, ZipArchiveMode.Create, leaveOpen: true))
+                {
+                    await foreach (var item in channel.Reader.ReadAllAsync(ct))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        try
+                        {
+                            var entry = zip.CreateEntry(item.Name, CompressionLevel.Fastest);
+                            await using var entryStream = entry.Open();
+                            await item.Response.ResponseStream.CopyToAsync(entryStream, ct);
+                        }
+                        finally
+                        {
+                            item.Response.Dispose();
+                        }
+                    }
                 }
             }
+            catch
+            {
+                producerCts.Cancel();
+                throw;
+            }
+
+            await producer;
             await partStream.FlushFinalAsync(ct);
 
             await _s3.CompleteMultipartUploadAsync(new CompleteMultipartUploadRequest
@@ -79,20 +135,29 @@ public class ExportZipJob
             var url = $"s3://{_bucket}/{finalKey}";
             await _repo.SaveUrlAsync(exportId, url);
 
-            try
+            if (_options.DeleteStagingOnComplete)
             {
-                foreach (var batch in staged.Chunk(1000))
+                // Fire-and-forget: cleanup must not delay the caller. Failures
+                // are logged and otherwise ignored — staging is reclaimable via
+                // an S3 lifecycle rule on the staging/ prefix.
+                _ = Task.Run(async () =>
                 {
-                    await _s3.DeleteObjectsAsync(new DeleteObjectsRequest
+                    try
                     {
-                        BucketName = _bucket,
-                        Objects = batch.Select(o => new KeyVersion { Key = o.Key }).ToList()
-                    }, ct);
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.LogWarning(ex, "Staging cleanup failed for {ExportId}", exportId);
+                        foreach (var batch in staged.Chunk(1000))
+                        {
+                            await _s3.DeleteObjectsAsync(new DeleteObjectsRequest
+                            {
+                                BucketName = _bucket,
+                                Objects = batch.Select(o => new KeyVersion { Key = o.Key }).ToList()
+                            }, CancellationToken.None);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "Staging cleanup failed for {ExportId}", exportId);
+                    }
+                }, CancellationToken.None);
             }
 
             return url;
@@ -104,4 +169,6 @@ public class ExportZipJob
             throw;
         }
     }
+
+    private readonly record struct StagedDownload(string Name, GetObjectResponse Response);
 }

@@ -12,13 +12,13 @@ public class ExportsStagedController : ControllerBase
 {
     private readonly IAmazonS3 _s3;
     private readonly string _bucket;
-    private readonly ExportZipJob _zipJob;
+    private readonly ExportZipJobQueue _queue;
 
-    public ExportsStagedController(IAmazonS3 s3, IOptions<S3Options> opt, ExportZipJob zipJob)
+    public ExportsStagedController(IAmazonS3 s3, IOptions<S3Options> opt, ExportZipJobQueue queue)
     {
         _s3 = s3;
         _bucket = opt.Value.BucketName;
-        _zipJob = zipJob;
+        _queue = queue;
     }
 
     /// <summary>Start a new staged export. Stateless — just returns a new exportId.</summary>
@@ -87,38 +87,22 @@ public class ExportsStagedController : ControllerBase
 
         var key = $"exports/{exportId}/staging/{fileName}";
 
-        // The AWS SDK's UploadPartAsync wraps InputStream in PartialWrapperStream,
-        // which requires a seekable base stream. ASP.NET's Request.Body is forward-only,
-        // so spool the part to a temp file and hand a seekable FileStream to the SDK.
-        var tempPath = Path.Combine(Path.GetTempPath(), $"s3part-{Guid.NewGuid():N}.tmp");
-        try
+        // Stream the part body straight to S3. DisablePayloadSigning avoids the
+        // SDK's seekable-stream requirement (PartialWrapperStream / SigV4 chunked
+        // signing) and removes the temp-file spool that previously dominated
+        // wall-clock time for large parts.
+        var resp = await _s3.UploadPartAsync(new UploadPartRequest
         {
-            await using (var spool = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write,
-                                                    FileShare.None, bufferSize: 81920, useAsync: true))
-            {
-                await Request.Body.CopyToAsync(spool, ct);
-            }
+            BucketName = _bucket,
+            Key = key,
+            UploadId = uploadId,
+            PartNumber = partNumber,
+            PartSize = Request.ContentLength.Value,
+            InputStream = Request.Body,
+            DisablePayloadSigning = true
+        }, ct);
 
-            await using var partStream = new FileStream(tempPath, FileMode.Open, FileAccess.Read,
-                                                       FileShare.Read, bufferSize: 81920, useAsync: true);
-
-            var resp = await _s3.UploadPartAsync(new UploadPartRequest
-            {
-                BucketName = _bucket,
-                Key = key,
-                UploadId = uploadId,
-                PartNumber = partNumber,
-                PartSize = partStream.Length,
-                InputStream = partStream
-            }, ct);
-
-            return Ok(new { etag = resp.ETag });
-        }
-        finally
-        {
-            try { if (System.IO.File.Exists(tempPath)) System.IO.File.Delete(tempPath); }
-            catch { /* best-effort cleanup */ }
-        }
+        return Ok(new { etag = resp.ETag });
     }
 
     /// <summary>Complete a multipart file upload to staging.</summary>
@@ -137,12 +121,42 @@ public class ExportsStagedController : ControllerBase
         return Ok();
     }
 
-    /// <summary>Complete the export: zip all staged files and upload the zip to S3.</summary>
+    /// <summary>
+    /// Queue the export-zip job and return immediately. The client polls
+    /// <c>GET /{exportId}/status</c> for completion. This keeps the request
+    /// thread off the (potentially long) download+zip+upload finalize path.
+    /// </summary>
     [HttpPost("{exportId:guid}/complete")]
-    public async Task<IActionResult> CompleteExport(Guid exportId, CancellationToken ct)
+    public IActionResult CompleteExport(Guid exportId)
     {
-        var url = await _zipJob.RunAsync(exportId, ct);
-        return Ok(new { exportId, s3Url = url });
+        var state = _queue.Enqueue(exportId);
+        return Accepted(new
+        {
+            exportId,
+            jobId = state.JobId,
+            status = state.Status.ToString().ToLowerInvariant()
+        });
+    }
+
+    /// <summary>Get the current status of an export-zip job.</summary>
+    [HttpGet("{exportId:guid}/status")]
+    public IActionResult GetStatus(Guid exportId)
+    {
+        var state = _queue.GetByExportId(exportId);
+        if (state is null)
+            return NotFound(new { exportId, message = "No export job found for this exportId." });
+
+        return Ok(new
+        {
+            exportId = state.ExportId,
+            jobId = state.JobId,
+            status = state.Status.ToString().ToLowerInvariant(),
+            s3Url = state.S3Url,
+            error = state.Error,
+            createdAt = state.CreatedAt,
+            startedAt = state.StartedAt,
+            completedAt = state.CompletedAt
+        });
     }
 }
 

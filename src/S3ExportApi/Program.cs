@@ -15,8 +15,10 @@ builder.Services.AddSingleton<IExportRepository, InMemoryExportRepository>();
 // Approach A
 builder.Services.AddSingleton<ExportSessionStore>();
 
-// Approach B — synchronous zip on /complete
+// Approach B — async zip on /complete, drained by ExportZipJobWorker
+builder.Services.AddSingleton<ExportZipJobQueue>();
 builder.Services.AddScoped<ExportZipJob>();
+builder.Services.AddHostedService<ExportZipJobWorker>();
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
