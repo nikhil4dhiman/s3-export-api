@@ -33,7 +33,7 @@ public sealed class ExportZipJobQueue
     private readonly Channel<ExportJobState> _channel =
         Channel.CreateUnbounded<ExportJobState>(new UnboundedChannelOptions
         {
-            SingleReader = false,
+            SingleReader = true,
             SingleWriter = false
         });
 
