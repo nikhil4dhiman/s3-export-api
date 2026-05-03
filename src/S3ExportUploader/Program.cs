@@ -416,34 +416,9 @@ internal sealed class ApproachBClient : IExportClient
         using var resp = await _http.PostAsync($"/api/approach-b/exports/{exportId}/complete", content: null);
         await Http.EnsureSuccess(resp);
 
-        // /complete is async: it returns 202 with a jobId. Poll the status
-        // endpoint until the background zip job finishes.
-        var queued = await resp.Content.ReadFromJsonAsync<CompleteAcceptedResponse>()
+        var done = await resp.Content.ReadFromJsonAsync<CompleteResponse>()
             ?? throw new InvalidOperationException("empty complete response");
-
-        var pollDelay = TimeSpan.FromMilliseconds(500);
-        var maxDelay = TimeSpan.FromSeconds(5);
-        while (true)
-        {
-            using var statusResp = await _http.GetAsync($"/api/approach-b/exports/{exportId}/status");
-            await Http.EnsureSuccess(statusResp);
-            var status = await statusResp.Content.ReadFromJsonAsync<JobStatusResponse>()
-                ?? throw new InvalidOperationException("empty status response");
-
-            switch (status.Status)
-            {
-                case "succeeded":
-                    return status.S3Url ?? "";
-                case "failed":
-                    throw new InvalidOperationException(
-                        $"Export zip job failed: {status.Error ?? "unknown error"}");
-                default:
-                    await Task.Delay(pollDelay);
-                    if (pollDelay < maxDelay)
-                        pollDelay = TimeSpan.FromMilliseconds(Math.Min(maxDelay.TotalMilliseconds, pollDelay.TotalMilliseconds * 1.5));
-                    break;
-            }
-        }
+        return done.S3Url;
     }
 
     private static List<(long offset, long length)> PlanParts(long total, long partSize)
@@ -470,18 +445,6 @@ internal sealed record StartResponse([property: JsonPropertyName("exportId")] Gu
 internal sealed record CompleteResponse(
     [property: JsonPropertyName("exportId")] Guid ExportId,
     [property: JsonPropertyName("s3Url")] string S3Url);
-
-internal sealed record CompleteAcceptedResponse(
-    [property: JsonPropertyName("exportId")] Guid ExportId,
-    [property: JsonPropertyName("jobId")] Guid JobId,
-    [property: JsonPropertyName("status")] string Status);
-
-internal sealed record JobStatusResponse(
-    [property: JsonPropertyName("exportId")] Guid ExportId,
-    [property: JsonPropertyName("jobId")] Guid JobId,
-    [property: JsonPropertyName("status")] string Status,
-    [property: JsonPropertyName("s3Url")] string? S3Url,
-    [property: JsonPropertyName("error")] string? Error);
 
 /// <summary>
 /// Read-only forward stream that exposes exactly <see cref="_length"/> bytes from the

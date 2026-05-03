@@ -12,13 +12,13 @@ public class ExportsStagedController : ControllerBase
 {
     private readonly IAmazonS3 _s3;
     private readonly string _bucket;
-    private readonly ExportZipJobQueue _queue;
+    private readonly ExportZipJob _zipJob;
 
-    public ExportsStagedController(IAmazonS3 s3, IOptions<S3Options> opt, ExportZipJobQueue queue)
+    public ExportsStagedController(IAmazonS3 s3, IOptions<S3Options> opt, ExportZipJob zipJob)
     {
         _s3 = s3;
         _bucket = opt.Value.BucketName;
-        _queue = queue;
+        _zipJob = zipJob;
     }
 
     /// <summary>Start a new staged export. Stateless — just returns a new exportId.</summary>
@@ -43,7 +43,8 @@ public class ExportsStagedController : ControllerBase
             Key = key,
             InputStream = Request.Body,
             AutoCloseStream = false,
-            DisablePayloadSigning = true
+            DisablePayloadSigning = true,
+            ChecksumAlgorithm = ChecksumAlgorithm.CRC32
         }, ct);
 
         return Ok(new { fileName });
@@ -60,7 +61,8 @@ public class ExportsStagedController : ControllerBase
         var init = await _s3.InitiateMultipartUploadAsync(new InitiateMultipartUploadRequest
         {
             BucketName = _bucket,
-            Key = key
+            Key = key,
+            ChecksumAlgorithm = ChecksumAlgorithm.CRC32
         }, ct);
 
         return Ok(new { fileUploadId = init.UploadId, key });
@@ -87,10 +89,6 @@ public class ExportsStagedController : ControllerBase
 
         var key = $"exports/{exportId}/staging/{fileName}";
 
-        // Stream the part body straight to S3. DisablePayloadSigning avoids the
-        // SDK's seekable-stream requirement (PartialWrapperStream / SigV4 chunked
-        // signing) and removes the temp-file spool that previously dominated
-        // wall-clock time for large parts.
         var resp = await _s3.UploadPartAsync(new UploadPartRequest
         {
             BucketName = _bucket,
@@ -99,7 +97,8 @@ public class ExportsStagedController : ControllerBase
             PartNumber = partNumber,
             PartSize = Request.ContentLength.Value,
             InputStream = Request.Body,
-            DisablePayloadSigning = true
+            DisablePayloadSigning = true,
+            ChecksumAlgorithm = ChecksumAlgorithm.CRC32
         }, ct);
 
         return Ok(new { etag = resp.ETag });
@@ -122,41 +121,15 @@ public class ExportsStagedController : ControllerBase
     }
 
     /// <summary>
-    /// Queue the export-zip job and return immediately. The client polls
-    /// <c>GET /{exportId}/status</c> for completion. This keeps the request
-    /// thread off the (potentially long) download+zip+upload finalize path.
+    /// Finalize the export: build a ZIP from all staged files using S3 server-side
+    /// copy (UploadPartCopy) so that file payloads never transit the API host.
+    /// Returns synchronously with the final S3 URL.
     /// </summary>
     [HttpPost("{exportId:guid}/complete")]
-    public IActionResult CompleteExport(Guid exportId)
+    public async Task<IActionResult> CompleteExport(Guid exportId, CancellationToken ct)
     {
-        var state = _queue.Enqueue(exportId);
-        return Accepted(new
-        {
-            exportId,
-            jobId = state.JobId,
-            status = state.Status.ToString().ToLowerInvariant()
-        });
-    }
-
-    /// <summary>Get the current status of an export-zip job.</summary>
-    [HttpGet("{exportId:guid}/status")]
-    public IActionResult GetStatus(Guid exportId)
-    {
-        var state = _queue.GetByExportId(exportId);
-        if (state is null)
-            return NotFound(new { exportId, message = "No export job found for this exportId." });
-
-        return Ok(new
-        {
-            exportId = state.ExportId,
-            jobId = state.JobId,
-            status = state.Status.ToString().ToLowerInvariant(),
-            s3Url = state.S3Url,
-            error = state.Error,
-            createdAt = state.CreatedAt,
-            startedAt = state.StartedAt,
-            completedAt = state.CompletedAt
-        });
+        var url = await _zipJob.RunAsync(exportId, ct);
+        return Ok(new { exportId, s3Url = url });
     }
 }
 

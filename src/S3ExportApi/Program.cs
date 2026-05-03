@@ -15,10 +15,8 @@ builder.Services.AddSingleton<IExportRepository, InMemoryExportRepository>();
 // Approach A
 builder.Services.AddSingleton<ExportSessionStore>();
 
-// Approach B — async zip on /complete, drained by ExportZipJobWorker
-builder.Services.AddSingleton<ExportZipJobQueue>();
+// Approach B — synchronous zip on /complete using S3 UploadPartCopy
 builder.Services.AddScoped<ExportZipJob>();
-builder.Services.AddHostedService<ExportZipJobWorker>();
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
