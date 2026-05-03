@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "S3 Export API — Approach B (Staged ZIP)",
-    "description": "Endpoints for the staged-zip approach. Each file is uploaded as its own object under `exports/{exportId}/staging/...` (using S3 multipart for large files). When `Complete export` is called, an `ExportZipJob` is **enqueued** and the endpoint returns `202 Accepted` with a `jobId`; a hosted background worker builds and uploads the final ZIP. Clients poll `Get export status` until `status` is `succeeded` (or `failed`).\n\nBecause there is no shared writer, **multiple files and multiple parts of the same file can be uploaded in parallel**.\n\n## Variables\n- `baseUrl` — e.g. `http://localhost:5000`\n- `exportId` — set automatically from `Start export`\n- `fileName` — name of the file being uploaded\n- `uploadId` — S3 multipart upload id, set automatically from `Start multipart file`\n- `partNumber` — 1-based part index for `Upload part`\n- `etagPart1` / `etagPart2` — ETags returned by `Upload part`, used in `Complete multipart file`\n\n## Typical flow\n1. Start export → captures `exportId`\n2. Upload small file (raw body) — repeat for each small file (can be parallel)\n3. Start multipart file → captures `uploadId`\n4. Upload part (×N, can be parallel; out-of-order is fine) — capture each `etag`\n5. Complete multipart file (send the parts list)\n6. Complete export → enqueues the zip job, returns `202` with `{ jobId, status: \"queued\" }`\n7. Get export status → poll until `status` is `succeeded`, then read `s3Url`",
+    "description": "Endpoints for the staged-zip approach. Each file is uploaded as its own object under `exports/{exportId}/staging/...` (using S3 multipart for large files). When `Complete export` is called, the server builds the final ZIP synchronously using S3 server-side copy (`CopyPartAsync`) for file data — no file bytes transit the API host for files >= 5 MiB. The response contains `{ exportId, s3Url }` with the final ZIP location.\n\nBecause there is no shared writer, **multiple files and multiple parts of the same file can be uploaded in parallel**.\n\n## Variables\n- `baseUrl` — e.g. `http://localhost:5000`\n- `exportId` — set automatically from `Start export`\n- `fileName` — name of the file being uploaded\n- `uploadId` — S3 multipart upload id, set automatically from `Start multipart file`\n- `partNumber` — 1-based part index for `Upload part`\n- `etagPart1` / `etagPart2` — ETags returned by `Upload part`, used in `Complete multipart file`\n\n## Typical flow\n1. Start export → captures `exportId`\n2. Upload small file (raw body) — repeat for each small file (can be parallel)\n3. Start multipart file → captures `uploadId`\n4. Upload part (×N, can be parallel; out-of-order is fine) — capture each `etag`\n5. Complete multipart file (send the parts list)\n6. Complete export → builds ZIP synchronously, returns `{ exportId, s3Url }`",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -164,19 +164,7 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "approach-b", "exports", "{{exportId}}", "complete"]
         },
-        "description": "Enqueues an `ExportZipJob` for the export and returns `202 Accepted` with `{ exportId, jobId, status: \"queued\" }`. A hosted background worker drains the queue, downloads each staged object in parallel (up to `S3:ZipFanOut`), streams them through a single ZIP writer, and uploads the result to `exports/{exportId}/final.zip`. Poll `Get export status` until completion."
-      }
-    },
-    {
-      "name": "7. Get export status",
-      "request": {
-        "method": "GET",
-        "url": {
-          "raw": "{{baseUrl}}/api/approach-b/exports/{{exportId}}/status",
-          "host": ["{{baseUrl}}"],
-          "path": ["api", "approach-b", "exports", "{{exportId}}", "status"]
-        },
-        "description": "Returns the current state of the zip job: `{ exportId, jobId, status, s3Url?, error?, createdAt, startedAt, completedAt }`. `status` is one of `queued`, `running`, `succeeded`, `failed`. When `succeeded`, `s3Url` contains the final ZIP location."
+        "description": "Builds the final ZIP synchronously using S3 server-side copy (CopyPartAsync) for file data >= 5 MiB. Returns `{ exportId, s3Url }` with the location of the final ZIP."
       }
     }
   ]

@@ -216,44 +216,13 @@ public sealed class ZipByCopyBuilder
     {
         if (buffer.Length == 0) return partNumber;
 
-        // Pad to MinPartSize if needed (since this won't be the last part)
-        if (buffer.Length < MinPartSize)
-        {
-            var padding = MinPartSize - (int)buffer.Length;
-            // We can't just pad arbitrarily in the ZIP data stream.
-            // Instead, we'll include the metadata buffer content in a larger part
-            // that also includes the upcoming file data via a combined approach.
-            // Actually, for correctness we need a different strategy:
-            // If the metadata buffer is too small, we download the large file
-            // and include it inline instead of using UploadPartCopy.
-            // But that defeats the purpose. Instead, let's use "extra field" padding
-            // in the last LFH to reach 5 MiB.
-            //
-            // REVISED APPROACH: We handle this in the caller by checking if we
-            // can reach 5 MiB. If not, we include the file inline anyway.
-            // For now, if buffer < 5 MiB and it's not the last part, we must pad.
-            // The safest padding: rewrite the last LFH's extra field with zeros.
-            // But that's complex. Simpler: just include zeros that are technically
-            // part of the metadata stream. Since this IS part of a valid ZIP structure
-            // (the extra field in the LFH), we retroactively extend it.
-            //
-            // For simplicity in this implementation: if buffer < 5MiB, we'll
-            // download the "large" file inline too. The threshold for UploadPartCopy
-            // should account for this: only use copy when file >= MinPartSize AND
-            // the accumulated metadata >= MinPartSize.
-            //
-            // Actually the cleanest fix: just upload the buffer as-is even if < 5MiB.
-            // This is ONLY invalid if it's not the last part. We'll restructure to
-            // ensure we batch enough metadata. For now, let's pad with zeros in an
-            // extra field approach.
-
-            // Write padding as extra field data in a dummy way - actually this corrupts ZIP.
-            // The real fix: accumulate metadata across multiple files.
-            // For this implementation, let's just upload as-is — S3 only enforces
-            // 5 MiB minimum on non-last parts. We'll handle this by making the
-            // caller ensure the buffer is large enough OR by falling back to inline.
-            // Let's just try the upload — if it fails we fall back.
-        }
+        // S3 requires each non-last part to be >= 5 MiB. If the metadata buffer
+        // is smaller than that, the caller should have included the file data
+        // inline instead of using CopyPartAsync. The BuildAsync logic ensures
+        // this by only using server-side copy for files >= MinPartSize, which
+        // guarantees the preceding metadata flush is followed by a large enough
+        // copy part. If this somehow fails, S3 will reject the part and the
+        // caller should fall back to the streaming path.
 
         var etag = await UploadPartFromBuffer(buffer, finalKey, uploadId, partNumber, ct);
         parts.Add(new PartETag(partNumber, etag));

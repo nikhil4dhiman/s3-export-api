@@ -62,7 +62,7 @@ POST /complete       → flushes ZIP central directory → CompleteMultipartUplo
 
 ## Approach B — Staged ZIP (stateless per request)
 
-Each file is uploaded directly to `exports/{exportId}/staging/{fileName}` in S3 as an independent object. When `/complete` is called the server **enqueues** an `ExportZipJob` and returns `202 Accepted` with a `jobId`; a hosted background worker then streams each staged object through a `ZipArchive` whose output is a new S3 multipart upload (`exports/{exportId}/final.zip`). Clients poll `GET /{exportId}/status` for completion. Staging cleanup is opt-in (`S3:DeleteStagingOnComplete`) and runs as fire-and-forget — the recommended path is an S3 lifecycle rule on the `staging/` prefix.
+Each file is uploaded directly to `exports/{exportId}/staging/{fileName}` in S3 as an independent object (with `ChecksumAlgorithm.CRC32` so that S3 stores a native checksum). When `/complete` is called the server **synchronously** builds the final ZIP using S3's `CopyPartAsync` (server-side copy) for file data ≥ 5 MiB — these bytes never transit the API host. Small files and ZIP metadata (local file headers, central directory) are uploaded as regular parts. The result is `exports/{exportId}/final.zip`. Staging cleanup is opt-in (`S3:DeleteStagingOnComplete`) and runs as fire-and-forget — the recommended path is an S3 lifecycle rule on the `staging/` prefix.
 
 **Best for:** horizontally scaled, stateless API deployments.
 
@@ -75,21 +75,25 @@ Each file is uploaded directly to `exports/{exportId}/staging/{fileName}` in S3 
 | `POST` | `/api/approach-b/exports/{exportId}/files/multipart/start` | Start S3 multipart upload to staging, returns `{ fileUploadId, key }` |
 | `PUT` | `/api/approach-b/exports/{exportId}/files/multipart/parts?fileName=&uploadId=&partNumber=` | Upload a part (requires `Content-Length` header) |
 | `POST` | `/api/approach-b/exports/{exportId}/files/multipart/complete` | Complete S3 multipart upload for a staged file |
-| `POST` | `/api/approach-b/exports/{exportId}/complete` | Queue the zip job, returns `202` with `{ exportId, jobId, status: "queued" }` |
-| `GET`  | `/api/approach-b/exports/{exportId}/status` | Poll job status, returns `{ status, s3Url?, error?, ... }` |
+| `POST` | `/api/approach-b/exports/{exportId}/complete` | Build the final ZIP synchronously, returns `{ exportId, s3Url }` |
 
-### How the Background Zip Works
+### How the ZIP Build Works
 
 ```
-POST /complete enqueues a job; ExportZipJobWorker drains the queue and runs:
+POST /complete runs synchronously (ZipByCopyBuilder):
   1. ListObjectsV2  exports/{exportId}/staging/*
-  2. InitiateMultipartUpload  exports/{exportId}/final.zip
-  3. Fan out N parallel GetObject downloads (S3:ZipFanOut, default 8) into a
-     bounded channel feeding a single ZipArchive writer (CompressionLevel.Fastest).
-  4. CompleteMultipartUpload on final.zip
-  5. (Optional) DeleteObjects for staging cleanup — fire-and-forget when
+  2. GetObjectAttributes in parallel (S3:ZipFanOut, default 8) to retrieve
+     CRC32 checksums — zero body data transfer. Falls back to streaming
+     CRC32 computation for objects uploaded without ChecksumAlgorithm.CRC32.
+  3. InitiateMultipartUpload  exports/{exportId}/final.zip
+  4. For each staged file:
+     - Files >= 5 MiB: UploadPart for ZIP local file header, then CopyPartAsync
+       for the file data (S3→S3, no API host traffic), then data descriptor.
+     - Files < 5 MiB: downloaded and included inline in the metadata part.
+  5. UploadPart for central directory + EOCD
+  6. CompleteMultipartUpload on final.zip
+  7. (Optional) DeleteObjects for staging cleanup — fire-and-forget when
      S3:DeleteStagingOnComplete = true; otherwise rely on a lifecycle rule.
-  6. Status endpoint returns s3://bucket/exports/{exportId}/final.zip
 ```
 
 No bytes touch local disk — `UploadPart` streams the request body straight to S3
