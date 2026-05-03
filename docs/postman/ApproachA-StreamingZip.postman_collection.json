@@ -1,0 +1,154 @@
+{
+  "info": {
+    "name": "S3 Export API — Approach A (Streaming ZIP)",
+    "description": "Endpoints for the streaming-zip approach. The ZIP is built on the fly and streamed directly to S3 via S3 multipart upload while the client uploads files. A per-session write lock serialises writes to the single open ZipArchive.\n\n## Variables\n- `baseUrl` — e.g. `http://localhost:5000`\n- `userId` — owner of the export (used in the S3 key)\n- `exportId` — set automatically from the response of `Start export`\n- `fileUploadId` — set automatically from the response of `Start multipart file`\n- `fileName` — name of the file being uploaded\n\n## Typical flow\n1. Start export → captures `exportId`\n2. Upload small file (raw body) — repeat for each small file\n3. Start multipart file → captures `fileUploadId`\n4. Upload part — repeat for each part of the same file (must be sequential)\n5. Complete multipart file (releases the per-session write lock)\n6. Complete export → returns the final S3 URL\n\nUse `Abort export` to discard an in-progress export.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5000" },
+    { "key": "userId", "value": "alice" },
+    { "key": "exportId", "value": "" },
+    { "key": "fileUploadId", "value": "" },
+    { "key": "fileName", "value": "notes.txt" }
+  ],
+  "item": [
+    {
+      "name": "1. Start export",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/start?userId={{userId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "start"],
+          "query": [{ "key": "userId", "value": "{{userId}}" }]
+        },
+        "description": "Initiates an S3 multipart upload and creates an in-memory ZipArchive bound to it. Returns `exportId`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.exportId) {",
+              "    pm.collectionVariables.set('exportId', json.exportId);",
+              "    console.log('exportId =', json.exportId);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Upload small file (raw body)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/octet-stream" }
+        ],
+        "body": {
+          "mode": "file",
+          "file": { "src": "" },
+          "description": "Select a local file in the Body tab — its bytes are streamed as the request body."
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/{{exportId}}/files?fileName={{fileName}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "{{exportId}}", "files"],
+          "query": [{ "key": "fileName", "value": "{{fileName}}" }]
+        },
+        "description": "Streams the raw request body into a new entry in the export ZIP. Acquires and releases the per-session write lock around the copy."
+      }
+    },
+    {
+      "name": "3. Start multipart file",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"fileName\": \"{{fileName}}\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/{{exportId}}/files/multipart/start",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "{{exportId}}", "files", "multipart", "start"]
+        },
+        "description": "Acquires the session write lock and opens a new ZIP entry. The lock is held until `complete multipart file`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json && json.fileUploadId) {",
+              "    pm.collectionVariables.set('fileUploadId', json.fileUploadId);",
+              "    console.log('fileUploadId =', json.fileUploadId);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Upload part (raw body)",
+      "request": {
+        "method": "PUT",
+        "header": [
+          { "key": "Content-Type", "value": "application/octet-stream" }
+        ],
+        "body": {
+          "mode": "file",
+          "file": { "src": "" },
+          "description": "Select the next chunk of the file. Parts are appended to the open zip entry in arrival order, so they MUST be sent sequentially."
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/{{exportId}}/files/multipart/{{fileUploadId}}/parts",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "{{exportId}}", "files", "multipart", "{{fileUploadId}}", "parts"]
+        }
+      }
+    },
+    {
+      "name": "5. Complete multipart file",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/{{exportId}}/files/multipart/{{fileUploadId}}/complete",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "{{exportId}}", "files", "multipart", "{{fileUploadId}}", "complete"]
+        },
+        "description": "Closes the ZIP entry stream and releases the per-session write lock so other files can be uploaded."
+      }
+    },
+    {
+      "name": "6. Complete export",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/{{exportId}}/complete",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "{{exportId}}", "complete"]
+        },
+        "description": "Disposes the ZipArchive (writes the central directory), completes the S3 multipart upload, persists the URL, and returns `s3Url`."
+      }
+    },
+    {
+      "name": "Abort export",
+      "request": {
+        "method": "DELETE",
+        "url": {
+          "raw": "{{baseUrl}}/api/approach-a/exports/{{exportId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "approach-a", "exports", "{{exportId}}"]
+        },
+        "description": "Disposes the session and aborts the underlying S3 multipart upload. Returns 204."
+      }
+    }
+  ]
+}
